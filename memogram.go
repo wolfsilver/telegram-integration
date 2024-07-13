@@ -59,6 +59,15 @@ func NewService() (*Service, error) {
 	}
 	s.bot = b
 
+	if config.AccessToken != "" {
+		parts := strings.Split(config.AccessToken, ":")
+		if len(parts) == 2 {
+			userID := parts[0]
+			accessToken := parts[1]
+			userAccessTokenCache.Store(userID, accessToken)
+		}
+	}
+
 	return s, nil
 }
 
