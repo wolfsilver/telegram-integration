@@ -65,6 +65,7 @@ func NewService() (*Service, error) {
 			userID := parts[0]
 			accessToken := parts[1]
 			userAccessTokenCache.Store(userID, accessToken)
+			slog.Info("load accessToken ", slog.Any("userID", userID))
 		}
 	}
 
