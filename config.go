@@ -10,6 +10,7 @@ import (
 type Config struct {
 	ServerAddr  string `env:"SERVER_ADDR,required"`
 	BotToken    string `env:"BOT_TOKEN,required"`
+	MemosAddr		string `env:"MEMOS_ADDR"`
 	AccessToken string `env:"ACCESS_TOKEN"`
 }
 
