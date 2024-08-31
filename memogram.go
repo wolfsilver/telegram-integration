@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/go-telegram/bot/models"
 	"github.com/pkg/errors"
 	"github.com/usememos/memogram/store"
+	"github.com/usememos/memos/plugin/httpgetter"
 	v1pb "github.com/usememos/memos/proto/gen/api/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -98,6 +100,14 @@ func (s *Service) Start(ctx context.Context) {
 }
 
 func (s *Service) createMemo(ctx context.Context, content string) (*v1pb.Memo, error) {
+	// if content is a URL, try to get the metadata.
+	if _, err := url.Parse(content); err == nil {
+		linkMetadata, err := httpgetter.GetHTMLMeta(content)
+		if err == nil {
+			content = fmt.Sprintf("[%s](%s)", linkMetadata.Description, content)
+		}
+	}
+
 	memo, err := s.client.MemoService.CreateMemo(ctx, &v1pb.CreateMemoRequest{
 		Content: content,
 	})
