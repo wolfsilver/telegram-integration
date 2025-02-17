@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -29,6 +31,8 @@ type Service struct {
 	config *Config
 	store  *store.Store
 	cache  *Cache
+
+	workspaceProfile *v1pb.WorkspaceProfile
 }
 
 func NewService() (*Service, error) {
@@ -60,6 +64,9 @@ func NewService() (*Service, error) {
 		bot.WithDefaultHandler(s.handler),
 		bot.WithCallbackQueryDataHandler("", bot.MatchTypePrefix, s.callbackQueryHandler),
 	}
+	if config.BotProxyAddr != "" {
+		opts = append(opts, bot.WithServerURL(config.BotProxyAddr))
+	}
 
 	b, err := bot.New(config.BotToken, opts...)
 	if err != nil {
@@ -79,6 +86,7 @@ func (s *Service) Start(ctx context.Context) {
 		return
 	}
 	slog.Info("workspace profile", slog.Any("profile", workspaceProfile))
+	s.workspaceProfile = workspaceProfile
 
 	// set bot commands
 	commands := []models.BotCommand{
@@ -109,7 +117,9 @@ func (s *Service) createMemo(ctx context.Context, content string) (*v1pb.Memo, e
 	}
 
 	memo, err := s.client.MemoService.CreateMemo(ctx, &v1pb.CreateMemoRequest{
-		Content: content,
+		Memo: &v1pb.Memo{
+			Content: content,
+		},
 	})
 	if err != nil {
 		slog.Error("failed to create memo", slog.Any("err", err))
@@ -145,35 +155,43 @@ func (s *Service) handleMemoCreation(ctx context.Context, m *models.Update, cont
 }
 
 func (s *Service) handler(ctx context.Context, b *bot.Bot, m *models.Update) {
-	if strings.HasPrefix(m.Message.Text, "/start ") {
+	if m.Message == nil {
+		slog.Error("memo message is nil")
+		return
+	}
+	message := m.Message
+	if strings.HasPrefix(message.Text, "/start ") {
 		s.startHandler(ctx, b, m)
 		return
-	} else if strings.HasPrefix(m.Message.Text, "/search ") {
+	} else if strings.HasPrefix(message.Text, "/search ") {
 		s.searchHandler(ctx, b, m)
 		return
 	}
 
-	userID := m.Message.From.ID
+	userID := message.From.ID
 	if _, ok := s.store.GetUserAccessToken(userID); !ok {
 		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: m.Message.Chat.ID,
+			ChatID: message.Chat.ID,
 			Text:   "Please start the bot with /start <access_token>",
 		})
 		return
 	}
 
-	message := m.Message
-	// TODO: handle message.Entities to get markdown text.
 	content := message.Text
+	contentEntities := message.Entities
 	if message.Caption != "" {
 		content = message.Caption
+		contentEntities = message.CaptionEntities
+	}
+	if len(contentEntities) > 0 {
+		content = formatContent(content, contentEntities)
 	}
 
 	// Add "forwarded from: originName" if message was forwarded
-	if m.Message.ForwardOrigin != nil {
+	if message.ForwardOrigin != nil {
 		var originName, originUsername string
 		// Determine the type of origin
-		switch origin := m.Message.ForwardOrigin; {
+		switch origin := message.ForwardOrigin; {
 		case origin.MessageOriginUser != nil: // User
 			user := origin.MessageOriginUser.SenderUser
 			if user.LastName != "" {
@@ -209,7 +227,7 @@ func (s *Service) handler(ctx context.Context, b *bot.Bot, m *models.Update) {
 	hasResource := message.Document != nil || len(message.Photo) > 0 || message.Voice != nil || message.Video != nil
 	if content == "" && !hasResource {
 		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: m.Message.Chat.ID,
+			ChatID: message.Chat.ID,
 			Text:   "Please input memo content",
 		})
 		return
@@ -222,7 +240,7 @@ func (s *Service) handler(ctx context.Context, b *bot.Bot, m *models.Update) {
 	memo, err := s.handleMemoCreation(ctx, m, content)
 	if err != nil {
 		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: m.Message.Chat.ID,
+			ChatID: message.Chat.ID,
 			Text:   "Failed to create memo",
 		})
 		return
@@ -242,9 +260,19 @@ func (s *Service) handler(ctx context.Context, b *bot.Bot, m *models.Update) {
 		s.processFileMessage(ctx, b, m, photo.FileID, memo)
 	}
 
+	memoUID, err := ExtractMemoUIDFromName(memo.Name)
+	if err != nil {
+		slog.Error("failed to extract memo UID", slog.Any("err", err))
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: message.Chat.ID,
+			Text:   "Failed to save memo",
+		})
+		return
+	}
+
 	b.SendMessage(ctx, &bot.SendMessageParams{
-		ChatID:              m.Message.Chat.ID,
-		Text:                fmt.Sprintf("Content saved as %s with [%s](%s/m/%s)", v1pb.Visibility_name[int32(memo.Visibility)], memo.Name, s.config.InstanceUrl, memo.Uid),
+		ChatID:              message.Chat.ID,
+		Text:                fmt.Sprintf("Content saved as %s with [%s](%s/m/%s)", v1pb.Visibility_name[int32(memo.Visibility)], memo.Name, s.workspaceProfile.InstanceUrl, memoUID),
 		ParseMode:           models.ParseModeMarkdown,
 		DisableNotification: true,
 		ReplyParameters: &models.ReplyParameters{
@@ -325,7 +353,6 @@ func (s *Service) callbackQueryHandler(ctx context.Context, b *bot.Bot, update *
 	action, memoName := parts[0], parts[1]
 
 	memo, err := s.client.MemoService.GetMemo(ctx, &v1pb.GetMemoRequest{
-		// memos/{id}
 		Name: memoName,
 	})
 	if err != nil {
@@ -376,10 +403,20 @@ func (s *Service) callbackQueryHandler(ctx context.Context, b *bot.Bot, update *
 	} else {
 		pinnedMarker = ""
 	}
+
+	memoUID, err := ExtractMemoUIDFromName(memo.Name)
+	if err != nil {
+		slog.Error("failed to extract memo UID", slog.Any("err", err))
+		b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+			CallbackQueryID: update.CallbackQuery.ID,
+			Text:            "Failed to update memo",
+		})
+		return
+	}
 	b.EditMessageText(ctx, &bot.EditMessageTextParams{
 		ChatID:      update.CallbackQuery.Message.Message.Chat.ID,
 		MessageID:   update.CallbackQuery.Message.Message.ID,
-		Text:        fmt.Sprintf("Memo updated as %s with [%s](%s/m/%s) %s", v1pb.Visibility_name[int32(memo.Visibility)], memo.Name, s.config.ServerAddr, memo.Uid, pinnedMarker),
+		Text:        fmt.Sprintf("Memo updated as %s with [%s](%s/m/%s) %s", v1pb.Visibility_name[int32(memo.Visibility)], memo.Name, s.config.ServerAddr, memoUID, pinnedMarker),
 		ParseMode:   models.ParseModeMarkdown,
 		ReplyMarkup: s.keyboard(memo),
 	})
@@ -393,14 +430,11 @@ func (s *Service) callbackQueryHandler(ctx context.Context, b *bot.Bot, update *
 func (s *Service) searchHandler(ctx context.Context, b *bot.Bot, m *models.Update) {
 	userID := m.Message.From.ID
 	searchString := strings.TrimPrefix(m.Message.Text, "/search ")
-
-	filterString := "content_search == ['" + searchString + "']"
-
 	accessToken, _ := s.store.GetUserAccessToken(userID)
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("Authorization", fmt.Sprintf("Bearer %s", accessToken)))
 	results, err := s.client.MemoService.ListMemos(ctx, &v1pb.ListMemosRequest{
 		PageSize: 10,
-		Filter:   filterString,
+		Filter:   fmt.Sprintf("content.contains('%s')", searchString),
 	})
 
 	if err != nil {
@@ -479,4 +513,49 @@ func (s *Service) sendError(b *bot.Bot, chatID int64, err error) {
 		ChatID: chatID,
 		Text:   fmt.Sprintf("Error: %s", err.Error()),
 	})
+}
+
+func formatContent(content string, contentEntities []models.MessageEntity) string {
+	contentRunes := utf16.Encode([]rune(content))
+
+	var sb strings.Builder
+	var prevEntity = models.MessageEntity{}
+	var entityContent string
+	re := regexp.MustCompile(`^(\s*)(.*)(\s*)$`)
+
+	for _, entity := range contentEntities {
+		switch entity.Type {
+		case models.MessageEntityTypeURL:
+		case models.MessageEntityTypeTextLink:
+		case models.MessageEntityTypeBold:
+		case models.MessageEntityTypeItalic:
+		default:
+			continue
+		}
+
+		if entity.Offset >= prevEntity.Offset+prevEntity.Length {
+			sb.WriteString(entityContent)
+			sb.WriteString(string(utf16.Decode(contentRunes[prevEntity.Offset+prevEntity.Length : entity.Offset])))
+			entityContent = string(utf16.Decode(contentRunes[entity.Offset : entity.Offset+entity.Length]))
+			prevEntity = entity
+			if strings.TrimSpace(entityContent) == "" {
+				continue
+			}
+		}
+
+		matches := re.FindStringSubmatch(entityContent)
+		switch entity.Type {
+		case models.MessageEntityTypeURL:
+			entityContent = fmt.Sprintf("%s[%s](%s)%s", matches[1], matches[2], matches[2], matches[3])
+		case models.MessageEntityTypeTextLink:
+			entityContent = fmt.Sprintf("%s[%s](%s)%s", matches[1], matches[2], entity.URL, matches[3])
+		case models.MessageEntityTypeBold:
+			entityContent = fmt.Sprintf("%s**%s**%s", matches[1], matches[2], matches[3])
+		case models.MessageEntityTypeItalic:
+			entityContent = fmt.Sprintf("%s*%s*%s", matches[1], matches[2], matches[3])
+		}
+	}
+	sb.WriteString(entityContent)
+	sb.WriteString(string(utf16.Decode(contentRunes[prevEntity.Offset+prevEntity.Length:])))
+	return sb.String()
 }
