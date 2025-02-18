@@ -108,14 +108,6 @@ func (s *Service) Start(ctx context.Context) {
 }
 
 func (s *Service) createMemo(ctx context.Context, content string) (*v1pb.Memo, error) {
-	// if content is a URL, try to get the metadata.
-	if _, err := url.Parse(content); err == nil {
-		linkMetadata, err := httpgetter.GetHTMLMeta(content)
-		if err == nil {
-			content = fmt.Sprintf("[%s](%s)", linkMetadata.Description, content)
-		}
-	}
-
 	memo, err := s.client.MemoService.CreateMemo(ctx, &v1pb.CreateMemoRequest{
 		Memo: &v1pb.Memo{
 			Content: content,
@@ -556,7 +548,15 @@ func formatContent(content string, contentEntities []models.MessageEntity) strin
 		matches := re.FindStringSubmatch(entityContent)
 		switch entity.Type {
 		case models.MessageEntityTypeURL:
-			entityContent = fmt.Sprintf("%s[%s](%s)%s", matches[1], matches[2], matches[2], matches[3])
+			// if content is a URL, try to get the metadata.
+			if _, err := url.Parse(matches[2]); err == nil {
+				linkMetadata, err := httpgetter.GetHTMLMeta(matches[2])
+				if err == nil {
+					entityContent = fmt.Sprintf("%s[%s](%s)%s", matches[1], linkMetadata.Description, matches[2], matches[3])
+				}
+			} else {
+				entityContent = fmt.Sprintf("%s[%s](%s)%s", matches[1], matches[2], matches[2], matches[3])
+			}
 		case models.MessageEntityTypeTextLink:
 			entityContent = fmt.Sprintf("%s[%s](%s)%s", matches[1], matches[2], entity.URL, matches[3])
 		case models.MessageEntityTypeBold:
